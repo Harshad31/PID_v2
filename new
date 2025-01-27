@@ -3,222 +3,220 @@
 #include <ModbusRTUSlave.h>
 #include <PID_v2.h>
 
-// Pin Definitions
 #define MAX31865_MISO 19
 #define MAX31865_MOSI 23
 #define MAX31865_CLK 18
 #define MAX31865_CS 5
+
 #define MAX485_DE 32
 #define MAX485_RE 33
 #define MAX485_RX 16
 #define MAX485_TX 17
-#define SSR_PIN 22
 
-// Wi-Fi Credentials
+Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX31865_CS, MAX31865_MOSI, MAX31865_MISO, MAX31865_CLK);
+
+ModbusRTUSlave modbus_slave(Serial1);
+const uint8_t slaveID = 1;
+const uint32_t baud = 9600;
+uint16_t holdingRegisters[6] = {0}; 
+
 const char* ssid = "equichem_5";
 const char* password = "equichem@2023";
 
-// NTP Time
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;  // GMT offset for Asia/Kolkata (UTC+5:30)
 const int daylightOffset_sec = 0;
 
-// MAX31865 and RTD Parameters
-Adafruit_MAX31865 thermo(MAX31865_CS, MAX31865_MOSI, MAX31865_MISO, MAX31865_CLK);
 #define R0 100.0
 #define Rref 430.0
+
 #define A 3.9083e-3
 #define B -5.775e-7
 #define C -4.183e-12
 
-// Modbus
-ModbusRTUSlave modbus_slave(Serial1);
-uint16_t holdingRegisters[6] = {0}; 
-const uint8_t slaveID = 1;
-const uint32_t baud = 9600;
+#define SSR_PIN 22  
 
-// Temperature Variables
+double setpoint = 55.0;  // Setpoint (Initial value)
+double lastSetpoint = 55.0;  // Store last setpoint for stability
+
 #define totalReadingsMAX31865 2
 double temperatureReadingsMAX31865[totalReadingsMAX31865] = {0};
+
+unsigned long lastReadingTime = 0;
+unsigned long lastControlCycleTime = 0;
+const long readingInterval = 250;  // Interval between readings (500ms)
+const long controlCycleInterval = 6000;  // Control cycle time (5000ms)
+
 float previousEMA = 0.0;
 const float alpha = 0.1;  // EMA smoothing factor
 
-// PID Control
-double setpoint = 55.0;
-double lastSetpoint = 55.0;
+// PID control variables
 double inputTemperature, output;
-double Kp = 0.8, Ki = 0.4, Kd = 1.6;  // PID parameters
-PID_v2 pidController(&inputTemperature, &output, &setpoint, Kp, Ki, Kd, P_ON_E, DIRECT);
+double Kp = 0.8, Ki = 0.4, Kd = 1.6;  // Normal PID parameters
 
-// Timers
-unsigned long lastReadingTime = 0;
-unsigned long lastControlCycleTime = 0;
-const long readingInterval = 250;
-const long controlCycleInterval = 6000;
+PID_v2 pidController(&inputTemperature, &output, &setpoint, Kp, Ki, Kd, P_ON_E, DIRECT);  // PID controller initialization
+
+// Heater power control variables
+const unsigned long controlCycleTime = 2000;  // Control cycle time in ms (2 seconds)
+unsigned long lastSSRUpdateTime = 0;         // Tracks the last time SSR state was updated
+bool ssrState = false;                       // Current SSR state (ON/OFF)
 
 void setup() {
   Serial.begin(115200);
-
-  // Initialize Pins
   pinMode(SSR_PIN, OUTPUT);
-  digitalWrite(SSR_PIN, LOW);
+  digitalWrite(SSR_PIN, LOW);  // SSR is off initially
 
-  pinMode(MAX485_DE, OUTPUT);
-  pinMode(MAX485_RE, OUTPUT);
-  receiveMode();
-
-  // Initialize Wi-Fi
-  connectWiFi();
-
-  // Initialize NTP
-  initializeNTP();
-
-  // Initialize MAX31865
-  thermo.begin(MAX31865_3WIRE);
-
-  // Initialize Modbus
-  Serial1.begin(baud, SERIAL_8N1, MAX485_RX, MAX485_TX);
-  modbus_slave.configureHoldingRegisters(holdingRegisters, 6);
-  modbus_slave.begin(slaveID, baud, SERIAL_8N1);
-
-  // Initialize PID
-  pidController.SetMode(AUTOMATIC);
-  pidController.SetOutputLimits(0, 1000);
-
-  Serial.println("Setup completed.");
-}
-
-void loop() {
-  modbus_slave.poll();  // Poll Modbus
-  updateSetpoint();     // Update setpoint if changed
-  readTemperature();    // Read temperature from MAX31865
-  performPIDControl();  // Perform PID-based control
-}
-
-void connectWiFi() {
+  // Connect to Wi-Fi
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
     Serial.println("Connecting to WiFi...");
   }
   Serial.println("WiFi connected.");
-}
 
-void initializeNTP() {
+  // Initialize NTP
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   struct tm timeinfo;
   for (int i = 0; i < 5; i++) {
     if (getLocalTime(&timeinfo)) {
-      Serial.println("Time synchronized.");
+      Serial.println("Time synchronized");
       break;
+    } else {
+      Serial.println("Failed to get time, retrying...");
+      delay(1000);  // Retry after 1 second
     }
-    delay(1000);
-    Serial.println("Retrying NTP synchronization...");
   }
+
+  // Initialize MAX31865
+  thermo.begin(MAX31865_3WIRE);
+
+  // Initialize PID control
+  pidController.SetMode(AUTOMATIC);  // Start PID control
+  pidController.SetOutputLimits(0, 100);  // Limit PID output to control SSR (0-100%)
+
+  // Initialize Modbus RTU (RS-485)
+  pinMode(MAX485_DE, OUTPUT);
+  pinMode(MAX485_RE, OUTPUT);
+  digitalWrite(MAX485_DE, LOW);  // Set DE low for receiver mode
+  digitalWrite(MAX485_RE, HIGH); // Set RE high for receiver mode
+  Serial1.begin(baud, SERIAL_8N1, MAX485_RX, MAX485_TX);
+
+  // Configure Modbus slave
+  modbus_slave.configureHoldingRegisters(holdingRegisters, 6);  // 6 registers now
+  modbus_slave.begin(slaveID, baud, SERIAL_8N1);
+
+  Serial.println("MAX31865 Temperature Sensor Initialized");
 }
 
-void updateSetpoint() {
-  double newSetpoint = holdingRegisters[0] / 10.0;  // Convert from tenths of degrees
+void loop() {
+  // Read Modbus registers
+  modbus_slave.poll();  // Poll Modbus slave
+
+  // Read setpoint from Modbus register (index 0)
+  double newSetpoint = holdingRegisters[0] / 10.0;  // Convert back from tenths of degrees
+
+  // Update setpoint only if it has changed significantly to avoid rapid changes
   if (abs(newSetpoint - lastSetpoint) > 0.1) {
     setpoint = newSetpoint;
     lastSetpoint = setpoint;
   }
-  if (setpoint < 25.0) setpoint = 25.0;
-  if (setpoint > 60.0) setpoint = 60.0;
-}
 
-void readTemperature() {
-  if (millis() - lastReadingTime < readingInterval) return;
-  lastReadingTime = millis();
-
-  // Read temperature
-  for (int i = 0; i < totalReadingsMAX31865; i++) {
-    uint16_t adcCode = thermo.readRTD();
-    float Rt = (adcCode * Rref) / 32768.0;
-    temperatureReadingsMAX31865[i] = Rt;
+  // Clamp setpoint to the defined limits (+18°C to +60°C)
+  if (setpoint < 25.0) {
+    setpoint = 25.0;
+  } else if (setpoint > 60.0) {
+    setpoint = 60.0;
   }
 
-  double tempSum = 0;
-  for (int i = 0; i < totalReadingsMAX31865; i++) {
-    tempSum += temperatureReadingsMAX31865[i];
+  // Temperature reading every 500ms
+  if (millis() - lastReadingTime >= readingInterval) {
+    lastReadingTime = millis();  // Update reading time
+
+    // Read from MAX31865 sensor (multiple readings for smoothing)
+    for (int i = 0; i < totalReadingsMAX31865; i++) {
+      uint16_t adcCode = thermo.readRTD();
+      float Rt = (adcCode * Rref) / 32768.0;
+      temperatureReadingsMAX31865[i] = Rt;
+    }
+
+    // Calculate average temperature
+    double tempSumMax31865 = 0;
+    for (int i = 0; i < totalReadingsMAX31865; i++) {
+      tempSumMax31865 += temperatureReadingsMAX31865[i];
+    }
+    float averagedRtMax31865 = tempSumMax31865 / totalReadingsMAX31865;
+    float temperatureMax31865 = calculateTemperature(averagedRtMax31865);
+
+    // Apply Exponential Moving Average (EMA)
+    previousEMA = alpha * temperatureMax31865 + (1 - alpha) * previousEMA;
+
+    // Apply the -0.1°C offset after EMA
+    float adjustedTemperature = previousEMA - 0.1;
+
+    // Update Modbus holding registers with the adjusted temperature
+    holdingRegisters[1] = (uint16_t)(adjustedTemperature * 10);  // Modbus register holds value in tenths of a degree
   }
 
-  float avgRt = tempSum / totalReadingsMAX31865;
-  float rawTemperature = calculateTemperature(avgRt);
+  // Control loop for PID and SSR
+  if (millis() - lastControlCycleTime >= controlCycleInterval) {
+    lastControlCycleTime = millis();  // Update control cycle time
 
-  previousEMA = alpha * rawTemperature + (1 - alpha) * previousEMA;
-  float adjustedTemperature = previousEMA - 0.1;
+    // Update PID control input with the most recent temperature reading
+    inputTemperature = previousEMA;
 
-  // Update Modbus register
-  holdingRegisters[1] = (uint16_t)(adjustedTemperature * 10);
+    // Compute the PID output
+    pidController.Compute();
 
-  // Update time in Modbus
-  updateTimeInModbus();
+    // Calculate SSR ON time based on PID output (as a percentage of controlCycleTime)
+    unsigned long onTime = (output / 100.0) * controlCycleTime;
 
-  Serial.printf("Temperature: %.2f°C, Adjusted: %.2f°C, Setpoint: %.1f°C\n", 
-                previousEMA, adjustedTemperature, setpoint);
-}
+    // Control SSR state based on ON time within the control cycle
+    unsigned long currentTime = millis();
+    if (currentTime - lastSSRUpdateTime >= controlCycleTime) {
+      lastSSRUpdateTime = currentTime;  // Start a new control cycle
+      ssrState = true;                  // Turn SSR ON at the start of the cycle
+    }
 
-void updateTimeInModbus() {
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    holdingRegisters[2] = timeinfo.tm_hour;
-    holdingRegisters[3] = timeinfo.tm_min;
-    holdingRegisters[4] = timeinfo.tm_sec;
-    holdingRegisters[5] = millis() % 1000;
-  } else {
-    Serial.println("Failed to get local time.");
+    // Turn SSR OFF if ON time has elapsed
+    if (ssrState && currentTime - lastSSRUpdateTime >= onTime) {
+      ssrState = false;  // Turn SSR OFF
+    }
+
+    // Set SSR state
+    digitalWrite(SSR_PIN, ssrState ? HIGH : LOW);
+
+    // Debug information
+    Serial.print("PID Output: ");
+    Serial.print(output, 2);
+    Serial.print("%, SSR State: ");
+    Serial.println(ssrState ? "ON" : "OFF");
   }
 }
 
-void performPIDControl() {
-  if (millis() - lastControlCycleTime < controlCycleInterval) return;
-  lastControlCycleTime = millis();
-
-  inputTemperature = previousEMA;
-  pidController.Compute();
-
-  if (output > 0) {
-    digitalWrite(SSR_PIN, HIGH);
-    Serial.println("Heater ON");
-  } else {
-    digitalWrite(SSR_PIN, LOW);
-    Serial.println("Heater OFF");
-  }
-
-  Serial.printf("PID Output: %.2f\n", output);
-}
-
+// Calculate temperature from RTD resistance
 float calculateTemperature(float Rt) {
+  float t;
   if (Rt >= R0) {
-    return (-A + sqrt(A * A - 4 * B * (1 - Rt / R0))) / (2 * B);
-  }
+    t = (-A + sqrt(A * A - 4 * B * (1 - Rt / R0))) / (2 * B);
+  } else {
+    float tolerance = 0.001;
+    int maxIterations = 100;
+    int iteration = 0;
+    float diff;
+    t = Rt;
 
-  float t = Rt;
-  float diff, tolerance = 0.001;
-  int iteration = 0, maxIterations = 100;
+    do {
+      float fValue = R0 * (1 + A * t + B * t * t + C * (t - 100) * t * t * t) - Rt;
+      float fDerivative = R0 * (A + 2 * B * t + 3 * C * (t - 100) * t * t + C * t * t * t);
+      float nextT = t - fValue / fDerivative;
+      diff = abs(nextT - t);
+      t = nextT;
+      iteration++;
+    } while (diff > tolerance && iteration < maxIterations);
 
-  do {
-    float fValue = R0 * (1 + A * t + B * t * t + C * (t - 100) * t * t * t) - Rt;
-    float fDerivative = R0 * (A + 2 * B * t + 3 * C * (t - 100) * t * t + C * t * t * t);
-    float nextT = t - fValue / fDerivative;
-    diff = abs(nextT - t);
-    t = nextT;
-    iteration++;
-  } while (diff > tolerance && iteration < maxIterations);
-
-  if (iteration == maxIterations) {
-    Serial.println("Temperature calculation failed to converge.");
+    if (iteration == maxIterations) {
+      Serial.println("Warning: Temperature calculation failed to converge.");
+    }
   }
   return t;
-}
-
-void transmitMode() {
-  digitalWrite(MAX485_DE, HIGH);
-  digitalWrite(MAX485_RE, HIGH);
-}
-
-void receiveMode() {
-  digitalWrite(MAX485_DE, LOW);
-  digitalWrite(MAX485_RE, LOW);
 }
